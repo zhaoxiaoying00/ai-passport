@@ -27,7 +27,8 @@ static const char *TAG="walkman";
 static QueueHandle_t inputs;
 static lv_obj_t *screen;
 static lv_display_t *display;
-static int page=3, view_page, selected, battery=-1, voice_scroll=-1;
+static int page=3, view_page, selected, battery=-1;
+static online_caption_cursor voice_caption;
 static unsigned physical_seen;
 static wa_state view;
 static nvs_handle_t storage;
@@ -43,7 +44,7 @@ typedef struct { char command; bool physical; } input_t;
 #define ROSE 0xf3c6d0
 #define CREAM 0xfffaf1
 #define GREEN 0x889ec2
-#define CAPTURE_LINES 20
+#define CAPTURE_LINES 8
 #define CAPTURE_STRIPES ((BSP_LCD_H + CAPTURE_LINES - 1) / CAPTURE_LINES)
 static uint16_t *capture_pixels;
 static int capture_start_y;
@@ -167,13 +168,30 @@ static void refresh(void) {
         static const char *names[]={"还差一步连接","正在连接","准备好了","你说，我在听","认真想一想","给你一点好心情","再试一次吧","连接设备热点"};
         label(net.recording?"麦克风开启 · 最长二十秒":"联网陪伴 · 麦克风关闭",18,46,204,true,MUTED);
         label(names[net.phase<=WN_SETUP?net.phase:WN_ERROR],19,141,202,false,INK);
-        char lines[48][ONLINE_LINE_BYTES];unsigned count=online_caption_lines(net.text,lines,48);
+        char lines[3][ONLINE_LINE_BYTES];
+        unsigned count=online_caption_page(net.text,voice_caption.active,lines);
+        unsigned old=voice_caption.active;
+        online_caption_update(&voice_caption,net.reply_id,net.reply_played,
+                              net.phase==WN_SPEAKING,(uint32_t)(esp_timer_get_time()/1000),
+                              net.page_samples,count);
+        if(old!=voice_caption.active) {
+            online_caption_page(net.text,voice_caption.active,lines);
+            printf("WM_PAGE {\"reply\":%u,\"page\":%u,\"sample\":%u,\"cue\":%lu,\"manual\":%s}\n",
+                   net.reply_id,voice_caption.active,net.reply_played,
+                   (unsigned long)net.page_samples[voice_caption.active],voice_caption.manual?"true":"false");
+        }
         if(count) {
-            unsigned top=voice_scroll<0?(count>3?count-3:0):(unsigned)voice_scroll;
-            if(top>count-1)top=count-1;
-            for(unsigned i=0;i<3 && top+i<count;++i){lv_obj_t *o=label(lines[top+i],22,173+(int)i*20,196,true,INK);lv_obj_set_style_text_font(o,&walkman_14,0);lv_obj_set_height(o,20);}
+            unsigned rows=0;while(rows<3 && lines[rows][0])++rows;
+            int top=(int)online_caption_top(rows);
+            for(unsigned row=0;row<rows;++row) {
+                lv_obj_t *o=label(lines[row],22,top+(int)row*20,196,true,INK);
+                lv_obj_set_style_text_font(o,&walkman_14,0);lv_obj_set_height(o,20);
+                lv_label_set_long_mode(o,LV_LABEL_LONG_CLIP);
+            }
         } else {lv_obj_t *o=label(net.message,25,180,190,true,MUTED);lv_obj_set_style_text_font(o,&walkman_14,0);lv_obj_set_height(o,48);}
-        if(net.recording)snprintf(text,sizeof(text),"%u / 20 秒",net.seconds);else snprintf(text,sizeof(text),"上下翻阅回应 · 音量 %u%%",s.player.volume*25);
+        if(net.recording)snprintf(text,sizeof(text),"%u / 20 秒",net.seconds);
+        else if(count)snprintf(text,sizeof(text),"上下翻页 · 音量 %u%%",s.player.volume*25);
+        else snprintf(text,sizeof(text),"上下翻阅回应 · 音量 %u%%",s.player.volume*25);
         label(text,20,245,200,true,MUTED);
         label(net.recording?"确定 · 说完发送":net.phase==WN_THINKING||net.phase==WN_SPEAKING?"确定 · 停止回应":"确定 · 开始说话",20,274,200,false,INK);
         label("长按确定 · 心情主页",20,305,200,true,MUTED);
@@ -215,11 +233,13 @@ static void status(void) {
     wa_state s=wa_status();
     printf("WM_STATE {\"page\":%d,\"selected\":%d,\"cue\":%d,\"subtitle_px\":14,\"track\":%u,\"count\":%u,\"volume\":%u,\"repeat\":%u,\"timer\":%u,\"timer_left\":%lu,\"playing\":%s,\"position\":%lu,\"ready\":%s,\"failed\":%s,\"blocks\":%u,\"peak\":%u,\"max_gap_us\":%u,\"max_render_us\":%u,\"stack_free\":%u,\"dropped\":%u,\"save_ok\":%s,\"physical\":%u,\"heap\":%lu,\"min_heap\":%lu}\n",page,selected,wm_active_cue(s.player.track,s.player.position),s.player.track,wm_track_count,s.player.volume,s.player.repeat,s.player.timer_minutes,(unsigned long)s.player.timer_left,s.player.playing?"true":"false",(unsigned long)s.player.position,s.ready?"true":"false",s.failed?"true":"false",s.blocks,s.peak,s.max_gap_us,s.max_render_us,s.stack_free,s.dropped,storage_ready&&!save_failed?"true":"false",physical_seen,(unsigned long)esp_get_free_heap_size(),(unsigned long)esp_get_minimum_free_heap_size());
     wn_state net=wn_status();
-    printf("WN_STATE {\"phase\":%u,\"wifi\":%s,\"configured\":%s,\"recording\":%s,\"played\":%u,\"dropped\":%u,\"starves\":%u,\"text_bytes\":%u,\"wifi_reason\":%u,\"testing\":%s,\"captured\":%u,\"uploaded\":%u,\"upload_ms\":%u,\"error_code\":%u,\"failures\":%u,\"connected\":%s,\"net_stack\":%u,\"ws_stack\":%u}\n",net.phase,net.wifi?"true":"false",net.configured?"true":"false",net.recording?"true":"false",net.played,net.dropped,net.starves,(unsigned)strlen(net.text),net.wifi_reason,net.testing?"true":"false",net.captured,net.uploaded,net.upload_ms,net.error_code,net.failures,net.connected?"true":"false",net.net_stack,net.ws_stack);
+    printf("WN_STATE {\"reply_id\":%u,\"reply_played\":%u,\"caption_next_sample\":%lu,\"caption_page\":%u,\"caption_pages\":%u,\"caption_manual\":%s,\"phase\":%u,\"wifi\":%s,\"configured\":%s,\"recording\":%s,\"played\":%u,\"dropped\":%u,\"starves\":%u,\"text_bytes\":%u,\"wifi_reason\":%u,\"testing\":%s,\"captured\":%u,\"uploaded\":%u,\"upload_ms\":%u,\"error_code\":%u,\"failures\":%u,\"connected\":%s,\"prepared\":%s,\"net_stack\":%u,\"ws_stack\":%u}\n",net.reply_id,net.reply_played,(unsigned long)(voice_caption.active+1<ONLINE_CAPTION_PAGES?net.page_samples[voice_caption.active+1]:UINT32_MAX),voice_caption.active,voice_caption.count,voice_caption.manual?"true":"false",net.phase,net.wifi?"true":"false",net.configured?"true":"false",net.recording?"true":"false",net.played,net.dropped,net.starves,(unsigned)strlen(net.text),net.wifi_reason,net.testing?"true":"false",net.captured,net.uploaded,net.upload_ms,net.error_code,net.failures,net.connected?"true":"false",net.prepared?"true":"false",net.net_stack,net.ws_stack);
     fflush(stdout);
 }
 static void key(char c) {
     wm_player p=wa_status().player;
+    /* USB-only long-reply regression probe; never opens the microphone. */
+    if(c=='j'){wa_command(WA_NETWORK,1);wn_command(WN_QUICK,2);page=4;voice_caption=(online_caption_cursor){0};return;}
     if(c=='O') { if(page==4){wn_command(WN_CANCEL,0);wa_command(WA_NETWORK,0);}page=page==3?0:3;selected=0;return; }
     if(c=='U' || c=='D') { wa_command(WA_VOLUME,c=='U'?(p.volume<4?p.volume+1:4):(p.volume?p.volume-1:0)); return; }
     if(page==0) { if(c=='u') wa_command(WA_PREV,0); if(c=='d') wa_command(WA_NEXT,0); if(c=='o') wa_command(WA_TOGGLE,0); }
@@ -227,15 +247,15 @@ static void key(char c) {
         if(c=='u')selected=(selected+5)%6;
         if(c=='d')selected=(selected+1)%6;
         if(c=='o') {
-            if(selected<3){if(wn_status().phase==WN_SETUP){page=5;return;}wa_command(WA_NETWORK,1);wn_command(selected==0?WN_RECORD:WN_QUICK,selected==2?1:0);page=4;voice_scroll=-1;}
+            if(selected<3){if(wn_status().phase==WN_SETUP){page=5;return;}wa_command(WA_NETWORK,1);wn_command(selected==0?WN_RECORD:WN_QUICK,selected==2?1:0);page=4;voice_caption=(online_caption_cursor){0};}
             else if(selected==3){wa_command(WA_NETWORK,0);page=0;}
             else if(selected==4){page=1;selected=0;}
             else{page=5;selected=0;}
         }
     } else if(page==4) {
         wn_state net=wn_status();
-        if(c=='o'){voice_scroll=-1;if(net.recording)wn_command(WN_STOP,0);else if(net.phase==WN_THINKING || net.phase==WN_SPEAKING || net.phase==WN_CONNECTING)wn_command(WN_CANCEL,0);else wn_command(WN_RECORD,0);}
-        if(c=='u' || c=='d'){char lines[48][ONLINE_LINE_BYTES];unsigned count=online_caption_lines(net.text,lines,48);if(voice_scroll<0)voice_scroll=count>3?(int)count-3:0;voice_scroll+=c=='u'?-1:1;if(voice_scroll<0)voice_scroll=0;if(voice_scroll>(int)count-1)voice_scroll=count?(int)count-1:0;}
+        if(c=='o'){voice_caption=(online_caption_cursor){0};if(net.recording)wn_command(WN_STOP,0);else if(net.phase==WN_THINKING || net.phase==WN_SPEAKING || net.phase==WN_CONNECTING)wn_command(WN_CANCEL,0);else wn_command(WN_RECORD,0);}
+        if(c=='u' || c=='d')online_caption_move(&voice_caption,c=='u'?-1:1,(uint32_t)(esp_timer_get_time()/1000));
     } else if(page==5) {
         if(c=='u' || c=='d')selected^=1;
         if(c=='o'){if(selected==1)wn_command(WN_CONFIGURE,0);else{page=3;selected=0;}}
@@ -287,7 +307,7 @@ static void serial_task(void *arg) {
         }
         if(c=='x'){wn_command(WN_DROP_PROBE,0);continue;}
         if(c=='z'){wa_command(WA_NETWORK,1);wn_command(WN_PROBE,0);continue;}
-        if(strchr("udoUDO?cs",c)) { input_t in={(char)c,false}; xQueueSend(inputs,&in,portMAX_DELAY); }
+        if(strchr("udoUDO?csj",c)) { input_t in={(char)c,false}; xQueueSend(inputs,&in,portMAX_DELAY); }
     }
 }
 

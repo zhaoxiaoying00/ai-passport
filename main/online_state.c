@@ -19,28 +19,159 @@ bool online_fragment(size_t *used,size_t cap,size_t off,size_t len,size_t total)
 void online_setup_password(uint32_t random_value,char out[9]) {
     snprintf(out,9,"%08lu",(unsigned long)(random_value%100000000u));
 }
-unsigned online_caption_lines(const char *text,char (*lines)[ONLINE_LINE_BYTES],unsigned cap) {
-    if(!cap)return 0;
-    unsigned row=0,chars=0,bytes=0;memset(lines,0,cap*ONLINE_LINE_BYTES);
-    for(const unsigned char *p=(const unsigned char*)text;*p;) {
+static void caption_store(unsigned row,const char *line,unsigned first,
+                          char (*lines)[ONLINE_LINE_BYTES],unsigned cap) {
+    if(row>=first && row-first<cap)snprintf(lines[row-first],ONLINE_LINE_BYTES,"%s",line);
+}
+static bool caption_punctuation(const unsigned char *p) {
+    unsigned c=*p;
+    if(c<128)return (c>=33 && c<=47) || (c>=58 && c<=64) ||
+                    (c>=91 && c<=96) || (c>=123 && c<=126);
+    if((c&0xf0)!=0xe0 || !p[1] || !p[2])return false;
+    c=((c&15)<<12)|((p[1]&63)<<6)|(p[2]&63);
+    return (c>=0x2010 && c<=0x2027) || (c>=0x3001 && c<=0x301f) ||
+           (c>=0xff01 && c<=0xff0f) || (c>=0xff1a && c<=0xff20) ||
+           (c>=0xff3b && c<=0xff40) || (c>=0xff5b && c<=0xff65);
+}
+static size_t caption_previous(const char *s,size_t at) {
+    if(at){do{--at;}while(at && ((unsigned char)s[at]&0xc0)==0x80);}
+    return at;
+}
+static bool caption_opening(const unsigned char *p) {
+    if(*p<128)return *p && strchr("([{<\"'",*p)!=NULL;
+    if(p[0]==0xc2 && p[1]==0xab)return true;
+    if((p[0]&0xf0)!=0xe0 || !p[1] || !p[2])return false;
+    unsigned c=((p[0]&15)<<12)|((p[1]&63)<<6)|(p[2]&63);
+    return c==0x2018 || c==0x201c || c==0x3008 || c==0x300a ||
+           c==0x300c || c==0x300e || c==0x3010 || c==0x3014 ||
+           c==0x3016 || c==0x3018 || c==0x301a || c==0xff08 ||
+           c==0xff3b || c==0xff5b;
+}
+static size_t caption_break_before(const char *s,size_t at) {
+    while(at) {
+        size_t prev=caption_previous(s,at);
+        if(!caption_punctuation((const unsigned char *)s+at) && s[at]!=' ' &&
+           !caption_opening((const unsigned char *)s+prev))break;
+        at=prev;
+    }
+    return at;
+}
+unsigned online_caption_slice(const char *text,unsigned first,char (*lines)[ONLINE_LINE_BYTES],unsigned cap) {
+    unsigned row=0,chars=0,bytes=0;
+    char current[ONLINE_LINE_BYTES]={0},previous[ONLINE_LINE_BYTES]={0};
+    if(cap)memset(lines,0,cap*ONLINE_LINE_BYTES);
+    for(const unsigned char *p=(const unsigned char *)text;*p;) {
         unsigned n=*p<128?1:(*p&0xe0)==0xc0?2:(*p&0xf0)==0xe0?3:4;
-        bool complete=true;for(unsigned i=1;i<n;i++)if(!p[i] || (p[i]&0xc0)!=0x80){complete=false;break;}
+        bool complete=true;
+        for(unsigned i=1;i<n;++i)if(!p[i] || (p[i]&0xc0)!=0x80){complete=false;break;}
         if(!complete)break;
         if(n==4){p+=n;continue;}
+        if(*p=='\r' || *p=='\t' || (!chars && *p==' ')){++p;continue;}
+        if(*p=='\n') {
+            const unsigned char *next=p+1;
+            while(*next=='\n' || *next=='\r' || *next==' ' || *next=='\t')++next;
+            if(caption_punctuation(next)){p=next;continue;}
+        }
+        if(chars==14 && (caption_punctuation(p) ||
+           caption_opening((const unsigned char *)current+caption_previous(current,bytes)))) {
+            size_t at=caption_previous(current,bytes);
+            at=caption_break_before(current,at);
+            /* An overlong punctuation-only run cannot fit on another line. */
+            if(!at){p+=n;continue;}
+            char carry[ONLINE_LINE_BYTES];snprintf(carry,sizeof(carry),"%s",current+at);
+            current[at]=0;caption_store(row,current,first,lines,cap);
+            memcpy(previous,current,sizeof(previous));++row;
+            snprintf(current,sizeof(current),"%s",carry);bytes=strlen(current);chars=0;
+            for(unsigned i=0;i<bytes;++i)if(((unsigned char)current[i]&0xc0)!=0x80)++chars;
+        }
         if(*p=='\n' || chars==14) {
-            if(chars){if(++row>=cap)return cap;bytes=chars=0;}
+            if(chars) {
+                caption_store(row,current,first,lines,cap);memcpy(previous,current,sizeof(previous));
+                ++row;bytes=chars=0;current[0]=0;
+            }
             if(*p=='\n'){++p;continue;}
         }
-        memcpy(lines[row]+bytes,p,n);bytes+=n;lines[row][bytes]=0;++chars;p+=n;
+        /* Keep opening quotes/brackets intact, including at the start of a
+         * reply. Dropping them leaves an unmatched closing mark later. */
+        if(!chars && caption_punctuation(p) && !caption_opening(p)){p+=n;continue;}
+        memcpy(current+bytes,p,n);bytes+=n;current[bytes]=0;++chars;p+=n;
     }
-    unsigned count=row+(chars?1:0);
-    // A dangling final character shares the preceding line after moving one glyph.
-    if(count>=2 && chars==1) {
-        char *prev=lines[count-2],*last=lines[count-1];size_t len=strlen(prev),at=len;
-        if(at){do{--at;}while(at && ((unsigned char)prev[at]&0xc0)==0x80);
-            size_t n=len-at;memmove(last+n,last,strlen(last)+1);memcpy(last,prev+at,n);prev[at]=0;}
+    /* Keep a word plus punctuation from becoming a tiny trailing row. */
+    if(row && chars && chars<4) {
+        size_t len=strlen(previous),at=len;unsigned moved=0;
+        while(at && moved<4-chars) {
+            at=caption_previous(previous,at);
+            ++moved;
+        }
+        at=caption_break_before(previous,at);
+        unsigned remaining=0;
+        for(size_t i=0;i<at;++i)if(((unsigned char)previous[i]&0xc0)!=0x80)++remaining;
+        if(remaining>=4) {
+            size_t n=len-at;memmove(current+n,current,strlen(current)+1);
+            memcpy(current,previous+at,n);previous[at]=0;
+            caption_store(row-1,previous,first,lines,cap);
+        }
     }
-    return count;
+    if(chars)caption_store(row,current,first,lines,cap);
+    return row+(chars?1:0);
+}
+unsigned online_caption_lines(const char *text,char (*lines)[ONLINE_LINE_BYTES],unsigned cap) {
+    unsigned count=online_caption_slice(text,0,lines,cap);
+    return count<cap?count:cap;
+}
+
+unsigned online_caption_top(unsigned rows) {
+    if(rows>3)rows=3;
+    return 173+(3-rows)*10;
+}
+static unsigned caption_page_first(unsigned rows,unsigned page) {
+    unsigned pages=(rows+2)/3;
+    if(pages && page>=pages)page=pages-1;
+    return page*3;
+}
+unsigned online_caption_page(const char *text,unsigned page,char lines[3][ONLINE_LINE_BYTES]) {
+    unsigned rows=online_caption_slice(text,0,NULL,0),pages=(rows+2)/3;
+    online_caption_slice(text,caption_page_first(rows,page),lines,3);
+    return pages;
+}
+
+unsigned online_caption_boundary(const char *text,unsigned page) {
+    if(!page)return 0;
+    char row[1][ONLINE_LINE_BYTES];const char *p=text;
+    /* Match each wrapped row in order, preserving repeated phrases and the
+     * raw offsets of skipped emoji, whitespace and punctuation. */
+    unsigned rows=online_caption_slice(text,0,NULL,0);
+    unsigned first=caption_page_first(rows,page);
+    for(unsigned i=0;i<first;++i) {
+        online_caption_slice(text,i,row,1);
+        for(const unsigned char *q=(const unsigned char *)row[0];*q;) {
+            unsigned n=*q<128?1:(*q&0xe0)==0xc0?2:3;
+            while(*p && strncmp(p,(const char *)q,n))++p;
+            if(!*p)return (unsigned)strlen(text);
+            p+=n;q+=n;
+        }
+    }
+    return (unsigned)(p-text);
+}
+void online_caption_update(online_caption_cursor *c,unsigned reply,unsigned played,
+                           bool speaking,uint32_t now,const uint32_t *starts,unsigned count) {
+    if(!c->initialized || c->reply!=reply)
+        *c=(online_caption_cursor){.initialized=true,.reply=reply};
+    c->count=count;
+    if(c->active>=count)c->active=count?count-1:0;
+    if(c->manual) {
+        if(now-c->manual_since<6000 || !speaking)return;
+        c->manual=false;
+    }
+    unsigned page=0;
+    while(page+1<count && starts[page+1]!=UINT32_MAX && played>=starts[page+1])++page;
+    c->active=page;
+}
+void online_caption_move(online_caption_cursor *c,int direction,uint32_t now) {
+    if(!c->count)return;
+    if(direction<0 && c->active)--c->active;
+    if(direction>0 && c->active+1<c->count)++c->active;
+    c->manual=true;c->manual_since=now;
 }
 
 static void json_space(const char **p,const char *end) {

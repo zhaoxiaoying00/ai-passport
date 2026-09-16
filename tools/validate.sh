@@ -52,6 +52,8 @@ run_static_checks() {
     "${test_dir}/test_online_state"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain tests/test_online_stream.c main/online_stream.c -o "${test_dir}/test_online_stream"
     "${test_dir}/test_online_stream"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain tests/test_online_tts.c main/online_tts.c -o "${test_dir}/test_online_tts"
+    "${test_dir}/test_online_tts"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain tests/test_online_upload.c main/online_upload.c -o "${test_dir}/test_online_upload"
     "${test_dir}/test_online_upload"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain tests/test_online_queue.c main/online_queue.c -o "${test_dir}/test_online_queue"

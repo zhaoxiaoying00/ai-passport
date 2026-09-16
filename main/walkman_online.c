@@ -1,6 +1,7 @@
 #include "walkman_online.h"
 #include "online_setup.h"
 #include "online_stream.h"
+#include "online_tts.h"
 #include "online_upload.h"
 #include "online_queue.h"
 #include "bsp_audio.h"
@@ -17,6 +18,7 @@
 #include "esp_sntp.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_heap_caps.h"
 #include "nvs.h"
 #include "cJSON.h"
@@ -41,13 +43,35 @@ static online_queue audio_queue;
 static portMUX_TYPE audio_lock=portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE lock=portMUX_INITIALIZER_UNLOCKED;
 static wn_state state={.phase=WN_UNCONFIGURED};
-static atomic_bool got_ip,connected,session_ready,recording,allowed,hello,failed,synthetic,closing;
+static atomic_bool got_ip,connected,session_ready,recording,allowed,hello,failed,synthetic,closing,warming;
 static atomic_uint epoch;
 static online_config_t config;
 static esp_websocket_client_handle_t socket_handle;
 static esp_transport_handle_t tls_transport,ws_transport;
 static char *frame;
 static online_stream stream;
+static online_tts_stream tts_stream;
+static bool tts_mode;
+static atomic_bool text_ready,tts_ready;
+static char tts_id[37];
+static unsigned tts_samples,tts_sentence,tts_base_byte,tts_max_byte,tts_word_byte;
+static bool tts_odd;
+static uint8_t tts_byte;
+static uint16_t page_bytes[ONLINE_CAPTION_PAGES];
+/* Restore bounded recent context when switching between the dialogue and
+ * timestamped synthesis sockets. No transcripts are written to flash. */
+static char history[2048];
+static unsigned history_used;
+static void remember(const char *text,bool assistant) {
+    size_t n=strlen(text);if(!n)return;
+    if(n+2>sizeof(history))return;
+    while(history_used+n+2>sizeof(history)) {
+        unsigned first=(unsigned)strlen(history+1)+2;
+        memmove(history,history+first,history_used-first);history_used-=first;
+    }
+    history[history_used++]=assistant?'a':'u';
+    memcpy(history+history_used,text,n+1);history_used+=(unsigned)n+1;
+}
 static unsigned stream_epoch;
 static size_t wire_used;
 static size_t used,base,chunk_used,chunk_total;
@@ -92,9 +116,14 @@ static void phase(unsigned p,const char *message) {
     if(!state.error_code || p==WN_ERROR){state.phase=p;if(message)snprintf(state.message,sizeof(state.message),"%s",message);}
     portEXIT_CRITICAL(&lock);
 }
-wn_state wn_status(void) {portENTER_CRITICAL(&lock);wn_state copy=state;portEXIT_CRITICAL(&lock);copy.testing=atomic_load(&synthetic);copy.recording=atomic_load(&recording) && !copy.testing;copy.captured=atomic_load(&received_samples);copy.wifi=atomic_load(&got_ip);copy.connected=atomic_load(&connected);return copy;}
+wn_state wn_status(void) {portENTER_CRITICAL(&lock);wn_state copy=state;portEXIT_CRITICAL(&lock);copy.testing=atomic_load(&synthetic);copy.recording=atomic_load(&recording) && !copy.testing;copy.captured=atomic_load(&received_samples);copy.wifi=atomic_load(&got_ip);copy.connected=atomic_load(&connected);copy.prepared=atomic_load(&warming) && atomic_load(&session_ready);return copy;}
 static void fail(unsigned code,const char *why) {
     atomic_store(&recording,false);atomic_store(&allowed,false);atomic_fetch_add(&epoch,1);
+    /* Background preparation is optional. An active request clears warming
+     * before taking ownership, so its errors still reach the user. */
+    if(atomic_load(&warming) && code!=WN_ERR_CONTROL && code!=WN_ERR_SYSTEM) {
+        ESP_LOGI(TAG,"preparation unavailable code=%u",code);atomic_store(&failed,true);return;
+    }
     portENTER_CRITICAL(&lock);
     bool first=state.error_code==WN_ERR_NONE;
     if(first){state.error_code=code;++state.failures;state.phase=WN_ERROR;snprintf(state.message,sizeof(state.message),"%s",why);}
@@ -125,6 +154,46 @@ static void append_text(const char *delta) {
     while(take && ((unsigned char)delta[take]&0xc0)==0x80)--take;
     memcpy(state.text+n,delta,take);state.text[n+take]=0;portEXIT_CRITICAL(&lock);
 }
+static bool tts_word(const char *prefix,const char *word,void *context) {
+    (void)context;
+    /* The service places sentence.index before its cumulative words array.
+     * If it ever changes ordering, retain the page instead of guessing. */
+    const char *sentence=strstr(prefix,"\"sentence\"");
+    const char *index=sentence?strstr(sentence,"\"index\""):NULL;
+    if(!index || !(index=strchr(index,':')))return true;
+    unsigned id=(unsigned)strtoul(index+1,NULL,10);
+    cJSON *j=cJSON_Parse(word);if(!j)return false;
+    cJSON *begin=cJSON_GetObjectItemCaseSensitive(j,"begin_time");
+    cJSON *at=cJSON_GetObjectItemCaseSensitive(j,"begin_index");
+    const char *text=field(j,"text");
+    if(!cJSON_IsNumber(begin) || !cJSON_IsNumber(at) || begin->valuedouble<0 || begin->valuedouble>3600000){cJSON_Delete(j);return false;}
+    if(id!=tts_sentence){tts_sentence=id;tts_base_byte=tts_max_byte;}
+    if(!at->valueint)tts_word_byte=tts_base_byte;
+    size_t length=strlen(text);
+    portENTER_CRITICAL(&lock);
+    const char *found=length?strstr(state.text+tts_word_byte,text):NULL;
+    if(found && (size_t)(found-(state.text+tts_word_byte))<24) {
+        unsigned end=(unsigned)(found-state.text+length);
+        /* The codec queues at most six 240-frame DMA descriptors. */
+        unsigned sample=(unsigned)begin->valueint*24+1440;
+        for(unsigned page=1;page<ONLINE_CAPTION_PAGES && page_bytes[page]!=UINT16_MAX;++page)
+            if(end>page_bytes[page] && state.page_samples[page]==UINT32_MAX)state.page_samples[page]=sample;
+        tts_word_byte=end;if(end>tts_max_byte)tts_max_byte=end;
+    }
+    portEXIT_CRITICAL(&lock);cJSON_Delete(j);return true;
+}
+static void tts_receive(void) {
+    cJSON *j=cJSON_Parse(frame);if(!j){fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");return;}
+    cJSON *header=cJSON_GetObjectItemCaseSensitive(j,"header");
+    const char *kind=field(header,"event");
+    if(!strcmp(kind,"task-started"))atomic_store(&tts_ready,true);
+    else if(!strcmp(kind,"task-finished") && atomic_load(&allowed)) {
+        if(tts_odd){cJSON_Delete(j);fail(WN_ERR_PROTOCOL,"语音格式不完整");return;}
+        packet p={.epoch=atomic_load(&epoch),.done=true};
+        if(!queue_push(&p,pdMS_TO_TICKS(150)))fail(WN_ERR_PLAYBACK_QUEUE,"语音结束确认失败");
+    } else if(!strcmp(kind,"task-failed"))fail(WN_ERR_PROVIDER,"语音服务暂不可用，请重试");
+    cJSON_Delete(j);
+}
 static void receive(void) {
     char *raw=NULL;size_t length=0;int audio=online_audio_event(frame,used,&raw,&length);
     if(audio<0){ESP_LOGW(TAG,"cloud JSON parse failed bytes=%u",(unsigned)used);fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");return;}
@@ -143,6 +212,7 @@ static void receive(void) {
     cJSON *j=cJSON_Parse(frame);if(!j){fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");return;}
     const char *type=field(j,"type");
     if(!strcmp(type,"session.updated")){atomic_store(&session_ready,true);phase(WN_READY,"准备好听你说啦");}
+    else if(!strcmp(type,"conversation.item.input_audio_transcription.completed"))remember(field(j,"transcript"),false);
     else if(!strcmp(type,"error")) {
         cJSON *error=cJSON_GetObjectItemCaseSensitive(j,"error");
         const char *code=field(error,"code");
@@ -150,8 +220,10 @@ static void receive(void) {
         (void)code;
     } else if(atomic_load(&allowed)) {
         if(!strcmp(type,"response.audio_transcript.delta") || !strcmp(type,"response.text.delta"))append_text(field(j,"delta"));
-        else if(!strcmp(type,"response.audio.done")) {
-            packet p={.epoch=atomic_load(&epoch),.done=true};if(!queue_push(&p,pdMS_TO_TICKS(150)))fail(WN_ERR_PLAYBACK_QUEUE,"语音结束确认失败");
+        else if(!strcmp(type,"response.done")) {
+            cJSON *response=cJSON_GetObjectItemCaseSensitive(j,"response");
+            if(!strcmp(field(response,"status"),"failed"))fail(WN_ERR_PROVIDER,"语音服务暂不可用，请重试");
+            else atomic_store(&text_ready,true);
         }
     }
     cJSON_Delete(j);
@@ -180,17 +252,32 @@ static void ws_event(void *arg,esp_event_base_t b,int32_t id,void *data) {
     } else if(id==WEBSOCKET_EVENT_DATA) {
         if(atomic_load(&failed))return;
         portENTER_CRITICAL(&lock);state.ws_stack=uxTaskGetStackHighWaterMark(NULL);portEXIT_CRITICAL(&lock);
-        esp_websocket_event_data_t *d=data;if(d->op_code!=1 && d->op_code!=0)return;
+        esp_websocket_event_data_t *d=data;
+        if(tts_mode && (d->op_code==2 || (d->op_code==0 && !assembling))) {
+            if(!atomic_load(&allowed))return;
+            if(d->data_len<0){fail(WN_ERR_PROTOCOL,"语音格式不完整");return;}
+            for(unsigned at=0;at<(unsigned)d->data_len;) {
+                packet p={.epoch=atomic_load(&epoch)};uint8_t *bytes=(uint8_t *)p.pcm;
+                if(tts_odd){bytes[p.len++]=tts_byte;tts_odd=false;}
+                unsigned n=(unsigned)d->data_len-at;if(n>PCM_BYTES-p.len)n=PCM_BYTES-p.len;
+                memcpy(bytes+p.len,d->data_ptr+at,n);p.len+=n;at+=n;
+                if(p.len%2){tts_odd=true;tts_byte=bytes[--p.len];}
+                if(p.len && !queue_push(&p,pdMS_TO_TICKS(150))){fail(WN_ERR_PLAYBACK_QUEUE,"网络语音拥塞，请重试");return;}
+                tts_samples+=p.len/2;
+            }
+            return;
+        }
+        if(d->op_code!=1 && d->op_code!=0)return;
         if(!frame || d->payload_offset<0 || d->data_len<0 || d->payload_len<0){fail(WN_ERR_PROTOCOL,"语音数据不完整");return;}
         if(!d->payload_offset) {
-            if(d->op_code==1){if(assembling){fail(WN_ERR_PROTOCOL,"语音分片顺序错误");return;}wire_used=0;assembling=true;stream_epoch=atomic_load(&epoch);online_stream_begin(&stream,frame,FRAME_MAX,stream_pcm,NULL);}
+            if(d->op_code==1){if(assembling){fail(WN_ERR_PROTOCOL,"语音分片顺序错误");return;}wire_used=0;assembling=true;stream_epoch=atomic_load(&epoch);if(tts_mode)online_tts_begin(&tts_stream,frame,FRAME_MAX,tts_word,NULL);else online_stream_begin(&stream,frame,FRAME_MAX,stream_pcm,NULL);}
             else if(!assembling || chunk_used!=chunk_total){fail(WN_ERR_PROTOCOL,"语音分片顺序错误");return;}
             base=wire_used;chunk_used=0;chunk_total=d->payload_len;
         }
         if(!assembling || base>=WIRE_MAX || chunk_total!=(size_t)d->payload_len || !online_fragment(&chunk_used,WIRE_MAX-base,d->payload_offset,d->data_len,d->payload_len)){fail(WN_ERR_PROTOCOL,"语音消息过长，请重试");return;}
-        if(!online_stream_feed(&stream,d->data_ptr,d->data_len)){ESP_LOGW(TAG,"cloud stream failure reason=%u metadata=%u wire=%u depth=%u audio=%d",stream.error,(unsigned)stream.used,(unsigned)wire_used,stream.depth,stream.audio);fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");atomic_store(&failed,true);return;}
+        if(!(tts_mode?online_tts_feed(&tts_stream,d->data_ptr,d->data_len):online_stream_feed(&stream,d->data_ptr,d->data_len))){ESP_LOGW(TAG,"cloud stream failure reason=%u metadata=%u wire=%u depth=%u audio=%d",stream.error,(unsigned)stream.used,(unsigned)wire_used,stream.depth,stream.audio);fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");atomic_store(&failed,true);return;}
         wire_used=base+chunk_used;
-        if(chunk_used==chunk_total && d->fin){if(!online_stream_end(&stream)){fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");atomic_store(&failed,true);return;}used=stream.used;receive();used=0;assembling=false;}
+        if(chunk_used==chunk_total && d->fin){if(!(tts_mode?online_tts_end(&tts_stream):online_stream_end(&stream))){fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");atomic_store(&failed,true);return;}used=tts_mode?tts_stream.used:stream.used;if(tts_mode)tts_receive();else receive();used=0;assembling=false;}
     }
 }
 static void wifi_event(void *arg,esp_event_base_t b,int32_t id,void *data) {
@@ -231,10 +318,19 @@ bool wn_configure_json(const char *raw) {
 }
 static void configure_session(void) {
     cJSON *j=event("session.update"),*s=cJSON_AddObjectToObject(j,"session");
-    cJSON *m=cJSON_AddArrayToObject(s,"modalities");cJSON_AddItemToArray(m,cJSON_CreateString("audio"));cJSON_AddItemToArray(m,cJSON_CreateString("text"));
+    cJSON *m=cJSON_AddArrayToObject(s,"modalities");cJSON_AddItemToArray(m,cJSON_CreateString("text"));
     cJSON_AddStringToObject(s,"voice","longanlingxin");cJSON_AddBoolToObject(s,"enable_speech_emotion",true);
-    cJSON_AddStringToObject(s,"instructions","你是元气随身听，一个俏皮温暖的语音伙伴。用自然中文口语、轻快可爱的语气，针对对方刚说的具体事情给出真诚回应和鼓励。每次两三句、六十字以内。不要称呼姓名或同学，不要强行积极或说教，不要假装真人，不要声称做了现实世界的事。对方难过时先理解感受。停顿自然连贯，不要逐字念。");
+    cJSON_AddStringToObject(s,"instructions","你是元气随身听，一个俏皮温暖的语音伙伴。用自然中文口语、轻快可爱的语气，针对对方刚说的具体事情给出真诚回应和鼓励。通常每次两三句、六十字以内；对方明确要求长内容时可适当展开。不要称呼姓名或同学，不要强行积极或说教，不要假装真人，不要声称做了现实世界的事。对方难过时先理解感受。停顿自然连贯，不要逐字念。");
+    cJSON *transcription=cJSON_AddObjectToObject(s,"input_audio_transcription");cJSON_AddStringToObject(transcription,"model","gummy-realtime-v1");
     cJSON_AddNullToObject(s,"turn_detection");cJSON_AddStringToObject(s,"input_audio_format","pcm");cJSON_AddStringToObject(s,"output_audio_format","pcm");cJSON_AddNumberToObject(s,"max_history_turns",6);send_json(j);
+    for(unsigned at=0;at<history_used;) {
+        bool assistant=history[at++]=='a';const char *text=history+at;at+=(unsigned)strlen(text)+1;
+        j=event("conversation.item.create");cJSON *item=cJSON_AddObjectToObject(j,"item");
+        cJSON_AddStringToObject(item,"type","message");cJSON_AddStringToObject(item,"role",assistant?"assistant":"user");
+        cJSON *content=cJSON_AddArrayToObject(item,"content"),*entry=cJSON_CreateObject();
+        cJSON_AddStringToObject(entry,"type",assistant?"output_text":"input_text");cJSON_AddStringToObject(entry,"text",text);cJSON_AddItemToArray(content,entry);
+        if(!send_json(j))break;
+    }
 }
 static bool prepare_playback(void) {
     ESP_LOGI(TAG,"playback reserve packets=%u packet_bytes=%u heap=%u largest=%u",ONLINE_QUEUE_EXTRA,(unsigned)sizeof(packet),(unsigned)esp_get_free_heap_size(),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
@@ -255,8 +351,8 @@ static bool prepare_playback(void) {
 static void begin(unsigned kind,unsigned value) {
     atomic_fetch_add(&epoch,1);clear_audio_queue();received_samples=0;
     free(upload_buffer);upload_buffer=NULL;
-    portENTER_CRITICAL(&lock);state.text[0]=0;state.seconds=0;state.uploaded=0;state.upload_ms=0;portEXIT_CRITICAL(&lock);atomic_store(&allowed,true);
-    atomic_store(&synthetic,kind==WN_PROBE);
+    portENTER_CRITICAL(&lock);++state.reply_id;state.reply_played=0;state.reply_finished=false;memset(state.page_samples,0xff,sizeof(state.page_samples));state.page_samples[0]=0;state.text[0]=0;state.seconds=0;state.uploaded=0;state.upload_ms=0;portEXIT_CRITICAL(&lock);atomic_store(&allowed,true);
+    atomic_store(&text_ready,false);atomic_store(&synthetic,kind==WN_PROBE);
     if(kind==WN_RECORD || kind==WN_PROBE) {
         upload_buffer=malloc(sizeof(*upload_buffer));
         if(!upload_buffer){fail(WN_ERR_MEMORY,"网络内存不足");return;}
@@ -265,20 +361,28 @@ static void begin(unsigned kind,unsigned value) {
         atomic_store(&recording,true);phase(WN_LISTENING,"我在听，说完按确定");
     }
     else {
-        if(!prepare_playback())return;
-        static const char *prompts[]={"今天需要一点鼓励，给我一句俏皮又真诚的夸夸。","我今天有点累，请温柔地陪我放松一下。","准备开始做一件事啦，给我打打气吧。"};
+        static const char *prompts[]={"今天需要一点鼓励，给我一句俏皮又真诚的夸夸。","我今天有点累，请温柔地陪我放松一下。","讲一个约一百字的小蜗牛的温柔小故事，包含一句用中文引号括起来的对话。"};
+        remember(prompts[value%3],false);
         cJSON *j=event("conversation.item.create"),*item=cJSON_AddObjectToObject(j,"item");cJSON_AddStringToObject(item,"type","message");cJSON_AddStringToObject(item,"role","user");
         cJSON *content=cJSON_AddArrayToObject(item,"content"),*text=cJSON_CreateObject();cJSON_AddStringToObject(text,"type","input_text");cJSON_AddStringToObject(text,"text",prompts[value%3]);cJSON_AddItemToArray(content,text);if(!send_json(j) || !send_json(event("response.create")))return;phase(WN_THINKING,"给我一点点时间");
     }
 }
 static void close_socket(void) {
+    bool had_socket=socket_handle!=NULL;
     atomic_store(&closing,true);
     atomic_store(&allowed,false);atomic_store(&recording,false);atomic_store(&synthetic,false);atomic_store(&session_ready,false);atomic_fetch_add(&epoch,1);
+    /* Wake the client's 1 s read poll before joining it. The closing flag
+     * distinguishes intentional teardown from an interrupted conversation. */
+    if(ws_transport){int fd=esp_transport_get_socket(ws_transport);if(fd>=0)shutdown(fd,SHUT_RDWR);}
     if(socket_handle){esp_websocket_client_stop(socket_handle);esp_websocket_client_destroy(socket_handle);socket_handle=NULL;}
     if(ws_transport){esp_transport_destroy(ws_transport);ws_transport=NULL;}
     if(tls_transport){esp_transport_destroy(tls_transport);tls_transport=NULL;}
     free(frame);frame=NULL;free(upload_buffer);upload_buffer=NULL;
-    atomic_store(&connected,false);atomic_store(&hello,false);atomic_store(&failed,false);clear_audio_queue();atomic_store(&closing,false);
+    atomic_store(&connected,false);atomic_store(&warming,false);atomic_store(&hello,false);atomic_store(&failed,false);atomic_store(&tts_ready,false);atomic_store(&text_ready,false);clear_audio_queue();
+    /* Let the idle task reclaim the deleted WebSocket stack before another
+     * TLS handshake allocates into the same small, fragmented heap. */
+    if(had_socket)vTaskDelay(pdMS_TO_TICKS(20));
+    atomic_store(&closing,false);
 }
 static bool open_socket(void) {
     char headers[240];snprintf(headers,sizeof(headers),"Authorization: Bearer %s\r\n",config.token);
@@ -286,17 +390,51 @@ static bool open_socket(void) {
     esp_transport_ssl_crt_bundle_attach(tls_transport,esp_crt_bundle_attach);esp_transport_set_default_port(tls_transport,443);
     ws_transport=esp_transport_ws_init(tls_transport);if(!ws_transport)return false;
     esp_transport_set_default_port(ws_transport,443);
-    const char *path=strchr(config.url+6,'/');
+    const char *url=tts_mode?"wss://dashscope.aliyuncs.com/api-ws/v1/inference":config.url;
+    const char *path=strchr(url+6,'/');
     esp_transport_ws_config_t transport_config={.ws_path=path,.headers=headers,.propagate_control_frames=true};
     if(esp_transport_ws_set_config(ws_transport,&transport_config)!=ESP_OK)return false;
     /* A 100 ms PCM append fits one WebSocket frame, avoiding five tiny writes. */
-    esp_websocket_client_config_t ws={.uri=config.url,.ext_transport=ws_transport,.buffer_size=4608,.task_stack=6144,
+    esp_websocket_client_config_t ws={.uri=url,.ext_transport=ws_transport,.buffer_size=4608,.task_stack=6144,
         .disable_auto_reconnect=true,.network_timeout_ms=8000,.ping_interval_sec=15,.crt_bundle_attach=esp_crt_bundle_attach};
     ESP_LOGI(TAG,"cloud start heap=%u largest=%u",(unsigned)esp_get_free_heap_size(),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     socket_handle=esp_websocket_client_init(&ws);memset(headers,0,sizeof(headers));
     if(!socket_handle)return false;
     if(esp_websocket_register_events(socket_handle,WEBSOCKET_EVENT_ANY,ws_event,NULL)!=ESP_OK)return false;
     esp_err_t result=esp_websocket_client_start(socket_handle);if(result!=ESP_OK)ESP_LOGW(TAG,"cloud start failed code=%d",result);return result==ESP_OK;
+}
+static cJSON *tts_event(const char *action) {
+    cJSON *j=cJSON_CreateObject(),*header=cJSON_AddObjectToObject(j,"header");
+    cJSON_AddStringToObject(header,"action",action);cJSON_AddStringToObject(header,"task_id",tts_id);
+    cJSON_AddStringToObject(header,"streaming","duplex");cJSON_AddObjectToObject(j,"payload");return j;
+}
+static void tts_start(void) {
+    snprintf(tts_id,sizeof(tts_id),"%08lx-%04x-4000-8000-%08lx%04x",(unsigned long)esp_random(),0x1234,(unsigned long)esp_random(),0x5678);
+    cJSON *j=tts_event("run-task"),*p=cJSON_GetObjectItemCaseSensitive(j,"payload");
+    cJSON_AddStringToObject(p,"task_group","audio");cJSON_AddStringToObject(p,"task","tts");
+    cJSON_AddStringToObject(p,"function","SpeechSynthesizer");cJSON_AddStringToObject(p,"model","qwen-audio-3.0-tts-plus");
+    cJSON_AddObjectToObject(p,"input");cJSON *params=cJSON_AddObjectToObject(p,"parameters");
+    cJSON_AddStringToObject(params,"text_type","PlainText");cJSON_AddStringToObject(params,"voice","longanlingxin");
+    cJSON_AddStringToObject(params,"format","pcm");cJSON_AddNumberToObject(params,"sample_rate",OUTPUT_RATE);
+    cJSON_AddBoolToObject(params,"word_timestamp_enabled",true);
+    cJSON_AddStringToObject(params,"instruction","用轻快温暖的语气自然地说，像朋友一样，停顿连贯，不要逐字念。");send_json(j);
+}
+static void tts_send_text(void) {
+    if(!prepare_playback())return;
+    cJSON *j=tts_event("continue-task"),*p=cJSON_GetObjectItemCaseSensitive(j,"payload"),*input=cJSON_AddObjectToObject(p,"input");
+    /* Text is immutable between realtime response.done and the next begin. */
+    cJSON_AddStringToObject(input,"text",state.text);
+    if(!send_json(j))return;
+    j=tts_event("finish-task");p=cJSON_GetObjectItemCaseSensitive(j,"payload");cJSON_AddObjectToObject(p,"input");send_json(j);
+}
+static bool start_synthesis(void) {
+    close_socket();tts_mode=true;
+    if(!state.text[0]){fail(WN_ERR_PROVIDER,"没有听清楚，再说一次吧");return false;}
+    remember(state.text,true);tts_odd=false;tts_samples=tts_base_byte=tts_max_byte=tts_word_byte=0;tts_sentence=0;
+    memset(page_bytes,0xff,sizeof(page_bytes));
+    char lines[3][ONLINE_LINE_BYTES];unsigned count=online_caption_page(state.text,0,lines);
+    for(unsigned page=1;page<count && page<ONLINE_CAPTION_PAGES;++page)page_bytes[page]=(uint16_t)online_caption_boundary(state.text,page);
+    atomic_store(&allowed,true);phase(WN_THINKING,"好心情马上送达");return open_socket();
 }
 static bool flush_upload(void) {
     if(!upload_buffer || !upload_buffer->samples_bytes)return true;
@@ -357,15 +495,14 @@ static void network_task(void *arg) {
                 free(upload_buffer);upload_buffer=NULL;
                 if(!uploaded){fail(WN_ERR_SEND,"录音发送失败，请重试");continue;}
                 if(received_samples<4000){fail(WN_ERR_SHORT_RECORD,"这次太短啦，再说一次吧");continue;}
-                if(!prepare_playback())continue;
                 if(atomic_load(&synthetic)){close_socket();phase(WN_READY,"准备好听你说啦");deadline=0;continue;}
                 if(!send_json(event("input_audio_buffer.commit")) || !send_json(event("response.create")))continue;
                 phase(WN_THINKING,"让我想想怎么回应你");deadline=esp_timer_get_time()+60000000;continue;
             }
             if(c.kind==WN_RECORD || c.kind==WN_QUICK || c.kind==WN_PROBE) {
                 unsigned now=current_phase();
-                if(now==WN_THINKING || now==WN_SPEAKING || now==WN_LISTENING || now==WN_ERROR || atomic_load(&failed) || (socket_handle && !atomic_load(&connected)))close_socket();
-                clear_error();
+                if(tts_mode || now==WN_THINKING || now==WN_SPEAKING || now==WN_LISTENING || now==WN_ERROR || atomic_load(&failed) || (socket_handle && !atomic_load(&connected) && !atomic_load(&warming)))close_socket();
+                atomic_store(&warming,false);tts_mode=false;clear_error();
                 pending=(int)c.kind;pending_value=c.value;phase(WN_CONNECTING,"正在准备语音陪伴");deadline=esp_timer_get_time()+30000000;
             }
         }
@@ -377,7 +514,12 @@ static void network_task(void *arg) {
             else if(!socket_handle && !open_socket()){fail(WN_ERR_TRANSPORT,"语音连接失败，请重试");pending=-1;close_socket();}
             if(!atomic_load(&failed) && atomic_load(&session_ready)){unsigned kind=(unsigned)pending;pending=-1;begin(kind,pending_value);deadline=esp_timer_get_time()+60000000;}
         }
-        if(!atomic_load(&failed) && atomic_exchange(&hello,false))configure_session();
+        if(!atomic_load(&failed) && atomic_exchange(&hello,false)){if(tts_mode)tts_start();else configure_session();}
+        if(!atomic_load(&failed) && atomic_exchange(&text_ready,false)) {
+            if(!start_synthesis())fail(WN_ERR_TRANSPORT,"语音连接失败，请重试");
+            deadline=esp_timer_get_time()+60000000;
+        }
+        if(!atomic_load(&failed) && atomic_exchange(&tts_ready,false))tts_send_text();
         packet p;if(!atomic_load(&failed) && upload_buffer && queue_pop(&p,pdMS_TO_TICKS(10)))upload(&p);
         if(atomic_load(&failed)){pending=-1;close_socket();deadline=0;}
         unsigned snapshot=current_phase();int64_t now=esp_timer_get_time();
@@ -387,7 +529,18 @@ static void network_task(void *arg) {
         if(pending<0 && !socket_handle && atomic_load(&got_ip) && snapshot==WN_CONNECTING) {
             phase(WN_READY,"准备好听你说啦");snapshot=current_phase();
         }
-        if(snapshot==WN_READY){if(!idle_since)idle_since=now;if(socket_handle && now-idle_since>45000000){close_socket();phase(WN_READY,"准备好听你说啦");}}else idle_since=0;
+        if(snapshot==WN_READY) {
+            if(!idle_since)idle_since=now;
+            if(socket_handle && tts_mode) {
+                /* Free synthesis and playback storage first; never keep two
+                 * TLS sessions alive on this board. No mic or reply is started. */
+                close_socket();tts_mode=false;atomic_store(&warming,true);
+                if(!open_socket())close_socket();
+                idle_since=esp_timer_get_time();
+            } else if(socket_handle && now-idle_since>20000000) {
+                close_socket();phase(WN_READY,"准备好听你说啦");
+            }
+        } else idle_since=0;
         if(deadline && now>deadline && (pending>=0 || snapshot==WN_THINKING)){pending=-1;close_socket();fail(WN_ERR_TIMEOUT,"等待有点久，按确定重试");deadline=0;}
         portENTER_CRITICAL(&lock);state.net_stack=uxTaskGetStackHighWaterMark(NULL);portEXIT_CRITICAL(&lock);
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -423,10 +576,14 @@ bool wn_audio_step(unsigned volume) {
     }
     if(queue_pop(&p,0)) {
         prefill_since=0;if(p.epoch!=atomic_load(&epoch) || !atomic_load(&allowed))return true;
-        if(p.done){playing=false;memset(p.pcm,0,sizeof(p.pcm));bsp_audio_write(p.pcm,sizeof(p.pcm));phase(WN_READY,"想继续聊，就按一下确定");return true;}
+        if(p.done){portENTER_CRITICAL(&lock);state.reply_finished=true;portEXIT_CRITICAL(&lock);playing=false;memset(p.pcm,0,sizeof(p.pcm));bsp_audio_write(p.pcm,sizeof(p.pcm));phase(WN_READY,"想继续聊，就按一下确定");return true;}
         playing=true;phase(WN_SPEAKING,"好心情正在送达");
         for(size_t i=0;i<p.len/2;++i)p.pcm[i]=(int16_t)((int)p.pcm[i]*(int)volume/4);
-        bool ok=bsp_audio_write(p.pcm,p.len)==ESP_OK;portENTER_CRITICAL(&lock);state.played+=p.len/2;portEXIT_CRITICAL(&lock);return ok;
+        bool ok=bsp_audio_write(p.pcm,p.len)==ESP_OK;
+        if(ok && p.epoch==atomic_load(&epoch)) {
+            portENTER_CRITICAL(&lock);state.played+=p.len/2;state.reply_played+=p.len/2;portEXIT_CRITICAL(&lock);
+        }
+        return ok;
     }
     if(playing){portENTER_CRITICAL(&lock);++state.starves;portEXIT_CRITICAL(&lock);}
     memset(p.pcm,0,sizeof(p.pcm));return bsp_audio_write(p.pcm,sizeof(p.pcm))==ESP_OK;
