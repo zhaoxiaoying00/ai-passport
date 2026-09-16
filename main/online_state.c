@@ -1,4 +1,14 @@
 #include "online_state.h"
+bool online_restore_send(online_restore *r) {
+    if(!r->configured || r->sent!=r->confirmed || r->sent>=r->total)return false;
+    ++r->sent;return true;
+}
+void online_restore_ack(online_restore *r,unsigned item) {
+    if(item==r->sent && item==r->confirmed+1)r->confirmed=item;
+}
+bool online_restore_ready(const online_restore *r) {
+    return r->configured && r->confirmed==r->total;
+}
 #include <stdio.h>
 #include <string.h>
 static bool bounded(const char *s,size_t n) {return memchr(s,0,n)!=NULL;}

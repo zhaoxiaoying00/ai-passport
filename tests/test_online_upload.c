@@ -7,11 +7,12 @@ static unsigned value(char c) {
     const char *found=strchr(alphabet,c);assert(found);return (unsigned)(found-alphabet);
 }
 int main(void) {
-    uint8_t pcm[3200];for(size_t i=0;i<sizeof(pcm);++i)pcm[i]=(uint8_t)(i*73+19);
+    uint8_t pcm[ONLINE_UPLOAD_PCM_MAX];for(size_t i=0;i<sizeof(pcm);++i)pcm[i]=(uint8_t)(i*73+19);
     for(size_t length=2;length<=sizeof(pcm);length+=2) {
         online_upload s;online_upload_begin(&s);
         for(size_t at=0;at<length;){size_t n=length-at;if(n>17)n=17;assert(online_upload_append(&s,pcm+at,n));at+=n;}
         size_t bytes=online_upload_finish(&s);assert(bytes>0 && bytes==strlen(s.json));assert(online_upload_finish(&s)==bytes);
+        assert(bytes+8<=ONLINE_UPLOAD_WIRE_MAX); /* Include the masked WS header. */
         assert(!online_upload_append(&s,pcm,1));
         const char *b=strstr(s.json,"\"audio\":\"");assert(b);b+=9;size_t out=0;
         while(*b!='"') {
@@ -25,7 +26,7 @@ int main(void) {
     }
     online_upload s;online_upload_begin(&s);assert(online_upload_finish(&s)==0);
     assert(online_upload_append(&s,pcm,1));assert(online_upload_finish(&s)==0);
-    assert(!online_upload_append(&s,pcm,3200));assert(s.samples_bytes==1);
-    assert(online_upload_append(&s,pcm+1,3199));assert(online_upload_finish(&s)>0);
+    assert(!online_upload_append(&s,pcm,sizeof(pcm)));assert(s.samples_bytes==1);
+    assert(online_upload_append(&s,pcm+1,sizeof(pcm)-1));assert(online_upload_finish(&s)>0);
     puts("Online upload: all even PCM lengths, split quartets, capacity and padding PASS");
 }

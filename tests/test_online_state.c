@@ -95,6 +95,19 @@ static void contiguous_pages(void) {
     }
 }
 int main(void) {
+    online_restore r={.total=3};
+    assert(!online_restore_send(&r) && !online_restore_ready(&r));
+    r.configured=true;
+    for(unsigned i=1;i<=3;++i) {
+        assert(online_restore_send(&r));
+        assert(!online_restore_send(&r) && !online_restore_ready(&r));
+        online_restore_ack(&r,i-1);online_restore_ack(&r,i+1);
+        assert(!online_restore_ready(&r) && !online_restore_send(&r));
+        online_restore_ack(&r,i);online_restore_ack(&r,i);
+        assert(online_restore_ready(&r)==(i==3));
+    }
+    r=(online_restore){0};assert(!online_restore_ready(&r));
+    r.configured=true;assert(online_restore_ready(&r) && !online_restore_send(&r));
     punctuation();
     captions();
     contiguous_pages();

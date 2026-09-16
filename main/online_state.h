@@ -2,6 +2,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+/* Replay history one acknowledged item at a time before opening capture. */
+typedef struct { unsigned total,sent,confirmed; bool configured; } online_restore;
+bool online_restore_send(online_restore *restore);
+void online_restore_ack(online_restore *restore,unsigned item);
+bool online_restore_ready(const online_restore *restore);
 typedef struct { uint32_t version; char ssid[33], password[65], url[256], token[193]; } online_config_t;
 bool online_config_valid(const online_config_t *config);
 bool online_fragment(size_t *used,size_t capacity,size_t offset,size_t length,size_t total);

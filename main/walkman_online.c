@@ -62,6 +62,8 @@ static uint16_t page_bytes[ONLINE_CAPTION_PAGES];
  * timestamped synthesis sockets. No transcripts are written to flash. */
 static char history[2048];
 static unsigned history_used;
+static online_restore restore;
+static unsigned restore_offset;
 static void remember(const char *text,bool assistant) {
     size_t n=strlen(text);if(!n)return;
     if(n+2>sizeof(history))return;
@@ -211,7 +213,13 @@ static void receive(void) {
     if(used>4096){fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");return;}
     cJSON *j=cJSON_Parse(frame);if(!j){fail(WN_ERR_PROTOCOL,"语音数据不完整，请重试");return;}
     const char *type=field(j,"type");
-    if(!strcmp(type,"session.updated")){atomic_store(&session_ready,true);phase(WN_READY,"准备好听你说啦");}
+    if(!strcmp(type,"session.updated")){portENTER_CRITICAL(&lock);restore.configured=true;portEXIT_CRITICAL(&lock);}
+    else if(!strcmp(type,"conversation.item.created")) {
+        cJSON *item=cJSON_GetObjectItemCaseSensitive(j,"item");unsigned number;
+        if(sscanf(field(item,"id"),"restore_%u",&number)==1) {
+            portENTER_CRITICAL(&lock);online_restore_ack(&restore,number);portEXIT_CRITICAL(&lock);
+        }
+    }
     else if(!strcmp(type,"conversation.item.input_audio_transcription.completed"))remember(field(j,"transcript"),false);
     else if(!strcmp(type,"error")) {
         cJSON *error=cJSON_GetObjectItemCaseSensitive(j,"error");
@@ -317,19 +325,28 @@ bool wn_configure_json(const char *raw) {
     if(e==ESP_OK){e=nvs_set_blob(n,"config",&c,sizeof(c));if(e==ESP_OK)e=nvs_commit(n);nvs_close(n);}memset(&c,0,sizeof(c));return e==ESP_OK;
 }
 static void configure_session(void) {
+    unsigned count=0;for(unsigned at=0;at<history_used;){at+=(unsigned)strlen(history+at+1)+2;++count;}
+    portENTER_CRITICAL(&lock);restore=(online_restore){.total=count};portEXIT_CRITICAL(&lock);restore_offset=0;
     cJSON *j=event("session.update"),*s=cJSON_AddObjectToObject(j,"session");
     cJSON *m=cJSON_AddArrayToObject(s,"modalities");cJSON_AddItemToArray(m,cJSON_CreateString("text"));
     cJSON_AddStringToObject(s,"voice","longanlingxin");cJSON_AddBoolToObject(s,"enable_speech_emotion",true);
     cJSON_AddStringToObject(s,"instructions","你是元气随身听，一个俏皮温暖的语音伙伴。用自然中文口语、轻快可爱的语气，针对对方刚说的具体事情给出真诚回应和鼓励。通常每次两三句、六十字以内；对方明确要求长内容时可适当展开。不要称呼姓名或同学，不要强行积极或说教，不要假装真人，不要声称做了现实世界的事。对方难过时先理解感受。停顿自然连贯，不要逐字念。");
     cJSON *transcription=cJSON_AddObjectToObject(s,"input_audio_transcription");cJSON_AddStringToObject(transcription,"model","gummy-realtime-v1");
     cJSON_AddNullToObject(s,"turn_detection");cJSON_AddStringToObject(s,"input_audio_format","pcm");cJSON_AddStringToObject(s,"output_audio_format","pcm");cJSON_AddNumberToObject(s,"max_history_turns",6);send_json(j);
-    for(unsigned at=0;at<history_used;) {
-        bool assistant=history[at++]=='a';const char *text=history+at;at+=(unsigned)strlen(text)+1;
-        j=event("conversation.item.create");cJSON *item=cJSON_AddObjectToObject(j,"item");
+}
+static void restore_history(void) {
+    portENTER_CRITICAL(&lock);
+    bool send=online_restore_send(&restore),ready=online_restore_ready(&restore);unsigned number=restore.sent;
+    portEXIT_CRITICAL(&lock);
+    if(ready){atomic_store(&session_ready,true);phase(WN_READY,"准备好听你说啦");return;}
+    if(send) {
+        bool assistant=history[restore_offset++]=='a';const char *text=history+restore_offset;restore_offset+=(unsigned)strlen(text)+1;
+        cJSON *j=event("conversation.item.create");cJSON *item=cJSON_AddObjectToObject(j,"item");
+        char id[32];snprintf(id,sizeof(id),"restore_%u",number);cJSON_AddStringToObject(item,"id",id);
         cJSON_AddStringToObject(item,"type","message");cJSON_AddStringToObject(item,"role",assistant?"assistant":"user");
         cJSON *content=cJSON_AddArrayToObject(item,"content"),*entry=cJSON_CreateObject();
         cJSON_AddStringToObject(entry,"type",assistant?"output_text":"input_text");cJSON_AddStringToObject(entry,"text",text);cJSON_AddItemToArray(content,entry);
-        if(!send_json(j))break;
+        send_json(j);
     }
 }
 static bool prepare_playback(void) {
@@ -394,12 +411,14 @@ static bool open_socket(void) {
     const char *path=strchr(url+6,'/');
     esp_transport_ws_config_t transport_config={.ws_path=path,.headers=headers,.propagate_control_frames=true};
     if(esp_transport_ws_set_config(ws_transport,&transport_config)!=ESP_OK)return false;
-    /* A 100 ms PCM append fits one WebSocket frame, avoiding five tiny writes. */
-    esp_websocket_client_config_t ws={.uri=url,.ext_transport=ws_transport,.buffer_size=4608,.task_stack=6144,
+    /* Recording messages fit both a WebSocket frame and the 2 KiB TLS
+     * output record. Keep synthesis buffering independent from upload. */
+    esp_websocket_client_config_t ws={.uri=url,.ext_transport=ws_transport,.buffer_size=tts_mode?4608:ONLINE_UPLOAD_WIRE_MAX,.task_stack=6144,
         .disable_auto_reconnect=true,.network_timeout_ms=8000,.ping_interval_sec=15,.crt_bundle_attach=esp_crt_bundle_attach};
     ESP_LOGI(TAG,"cloud start heap=%u largest=%u",(unsigned)esp_get_free_heap_size(),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     socket_handle=esp_websocket_client_init(&ws);memset(headers,0,sizeof(headers));
     if(!socket_handle)return false;
+    portENTER_CRITICAL(&lock);restore=(online_restore){0};portEXIT_CRITICAL(&lock);
     if(esp_websocket_register_events(socket_handle,WEBSOCKET_EVENT_ANY,ws_event,NULL)!=ESP_OK)return false;
     esp_err_t result=esp_websocket_client_start(socket_handle);if(result!=ESP_OK)ESP_LOGW(TAG,"cloud start failed code=%d",result);return result==ESP_OK;
 }
@@ -443,6 +462,7 @@ static bool flush_upload(void) {
     int64_t started=esp_timer_get_time();
     bool ok=socket_handle && esp_websocket_client_send_text(socket_handle,upload_buffer->json,length,pdMS_TO_TICKS(2000))==(int)length;
     unsigned duration=(unsigned)((esp_timer_get_time()-started)/1000);
+    if(duration>100){wifi_ap_record_t ap={0};esp_wifi_sta_get_ap_info(&ap);ESP_LOGW(TAG,"upload delayed ms=%u queue=%u heap=%u largest=%u rssi=%d",duration,queued(),(unsigned)esp_get_free_heap_size(),(unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),ap.rssi);}
     portENTER_CRITICAL(&lock);if(ok)state.uploaded+=upload_buffer->samples_bytes/2;if(duration>state.upload_ms)state.upload_ms=duration;portEXIT_CRITICAL(&lock);
     online_upload_begin(upload_buffer);
     if(!ok)fail(WN_ERR_SEND,"录音发送失败，请重试");
@@ -515,12 +535,17 @@ static void network_task(void *arg) {
             if(!atomic_load(&failed) && atomic_load(&session_ready)){unsigned kind=(unsigned)pending;pending=-1;begin(kind,pending_value);deadline=esp_timer_get_time()+60000000;}
         }
         if(!atomic_load(&failed) && atomic_exchange(&hello,false)){if(tts_mode)tts_start();else configure_session();}
+        if(!tts_mode && atomic_load(&connected) && !atomic_load(&failed) && !atomic_load(&session_ready))restore_history();
         if(!atomic_load(&failed) && atomic_exchange(&text_ready,false)) {
             if(!start_synthesis())fail(WN_ERR_TRANSPORT,"语音连接失败，请重试");
             deadline=esp_timer_get_time()+60000000;
         }
         if(!atomic_load(&failed) && atomic_exchange(&tts_ready,false))tts_send_text();
-        packet p;if(!atomic_load(&failed) && upload_buffer && queue_pop(&p,pdMS_TO_TICKS(10)))upload(&p);
+        packet p;
+        for(unsigned batch=0;batch<4 && !atomic_load(&failed) && upload_buffer;++batch) {
+            if(!queue_pop(&p,0))break;
+            upload(&p);
+        }
         if(atomic_load(&failed)){pending=-1;close_socket();deadline=0;}
         unsigned snapshot=current_phase();int64_t now=esp_timer_get_time();
         /* Only an outstanding request owns a timeout. Idle Wi-Fi recovery
@@ -543,7 +568,9 @@ static void network_task(void *arg) {
         } else idle_since=0;
         if(deadline && now>deadline && (pending>=0 || snapshot==WN_THINKING)){pending=-1;close_socket();fail(WN_ERR_TIMEOUT,"等待有点久，按确定重试");deadline=0;}
         portENTER_CRITICAL(&lock);state.net_stack=uxTaskGetStackHighWaterMark(NULL);portEXIT_CRITICAL(&lock);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        /* Drain queued capture promptly; do not add a fixed 5 ms delay to
+         * every small upload while the microphone keeps producing data. */
+        vTaskDelay(pdMS_TO_TICKS(upload_buffer && queued()?1:5));
     }
 }
 bool wn_audio_step(unsigned volume) {
@@ -561,7 +588,7 @@ bool wn_audio_step(unsigned volume) {
         if(!atomic_load(&recording) || generation!=atomic_load(&epoch))return true;
         p.len=PCM_BYTES;p.epoch=generation;p.done=false;p.input=true;received_samples+=PCM_BYTES/2;
         portENTER_CRITICAL(&lock);state.seconds=received_samples/16000;portEXIT_CRITICAL(&lock);
-        if(!queue_push(&p,0)){portENTER_CRITICAL(&lock);++state.dropped;portEXIT_CRITICAL(&lock);fail(WN_ERR_CAPTURE_QUEUE,"网络有点慢，请重新说一次");}
+        if(!queue_push(&p,0)){portENTER_CRITICAL(&lock);++state.dropped;portEXIT_CRITICAL(&lock);fail(WN_ERR_CAPTURE_QUEUE,"录音发送失败，请重试");}
         if(received_samples>=20*16000)wn_command(WN_STOP,0);
         return true;
     }
